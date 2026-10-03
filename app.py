@@ -80,17 +80,20 @@ else:
         )
         ym_key = f"{selected_year}-{selected_month:02d}"
 
-        # 從 Supabase 讀取該使用者、該年月的預算
-        bud_resp = supabase.table("budgets").select("*").eq("user_email", user_email).eq("ym", ym_key).execute()
-        existing_bud = pd.DataFrame(bud_resp.data) if bud_resp.data else pd.DataFrame()
+        # 安全讀取該使用者、該年月的預算
+        try:
+            bud_resp = supabase.table("budgets").select("*").eq("user_email", user_email).eq("ym", ym_key).execute()
+            existing_bud = pd.DataFrame(bud_resp.data) if bud_resp.data else pd.DataFrame()
+        except Exception:
+            existing_bud = pd.DataFrame()
 
         init_income = (
-            existing_bud["income"].iloc[0] if not existing_bud.empty else 50000.0
+            float(existing_bud["income"].iloc[0]) if not existing_bud.empty and "income" in existing_bud.columns else 50000.0
         )
 
         with st.form("budget_form"):
             income_input = st.number_input(
-                "💵 本月預估總收入", min_value=0.0, step=1000.0, value=float(init_income)
+                "💵 本月預估總收入", min_value=0.0, step=1000.0, value=init_income
             )
             st.markdown("---")
             st.write("💡 **各類別預算分配**：")
@@ -98,7 +101,7 @@ else:
             cat_budgets = {}
             for cat in CATEGORIES:
                 cat_val = 0.0
-                if not existing_bud.empty:
+                if not existing_bud.empty and "category" in existing_bud.columns and "budget_amount" in existing_bud.columns:
                     match = existing_bud[existing_bud["category"] == cat]
                     if not match.empty:
                         cat_val = float(match["budget_amount"].iloc[0])
@@ -115,7 +118,6 @@ else:
             )
 
             if save_bud_btn:
-                # 刪除舊預算，重新覆寫
                 supabase.table("budgets").delete().eq("user_email", user_email).eq("ym", ym_key).execute()
                 new_bud_rows = []
                 for cat, bud_val in cat_budgets.items():
@@ -132,11 +134,14 @@ else:
                 st.success(f"已儲存 {ym_key} 的預算設定！")
                 st.rerun()
 
-    # 從 Supabase 讀取支出全量資料
-    exp_resp = supabase.table("expenses").select("*").eq("user_email", user_email).order("date", descending=True).execute()
-    df_exp = pd.DataFrame(exp_resp.data) if exp_resp.data else pd.DataFrame()
+    # 安全從 Supabase 讀取支出全量資料
+    try:
+        exp_resp = supabase.table("expenses").select("*").eq("user_email", user_email).order("date", descending=True).execute()
+        df_exp = pd.DataFrame(exp_resp.data) if exp_resp.data else pd.DataFrame()
+    except Exception:
+        df_exp = pd.DataFrame()
 
-    if not df_exp.empty:
+    if not df_exp.empty and "date" in df_exp.columns:
         df_exp["date"] = pd.to_datetime(df_exp["date"])
         df_exp["年月"] = df_exp["date"].dt.strftime("%Y-%m")
 
@@ -144,47 +149,49 @@ else:
     with tab3:
         st.subheader("📊 月度預算 vs 實際支出結算")
 
-        if df_exp.empty:
+        if df_exp.empty or "年月" not in df_exp.columns:
             st.info("尚無記帳資料，請先新增支出！")
         else:
             available_months = sorted(df_exp["年月"].unique(), reverse=True)
             sel_ym = st.selectbox("選擇結算月份", available_months)
 
-            # 當月支出
             m_exp = df_exp[df_exp["年月"] == sel_ym]
 
-            # 當月預算
-            b_resp = supabase.table("budgets").select("*").eq("user_email", user_email).eq("ym", sel_ym).execute()
-            m_bud = pd.DataFrame(b_resp.data) if b_resp.data else pd.DataFrame()
+            try:
+                b_resp = supabase.table("budgets").select("*").eq("user_email", user_email).eq("ym", sel_ym).execute()
+                m_bud = pd.DataFrame(b_resp.data) if b_resp.data else pd.DataFrame()
+            except Exception:
+                m_bud = pd.DataFrame()
 
-            actual_total_exp = m_exp["amount"].sum()
-            income_val = m_bud["income"].iloc[0] if not m_bud.empty else 0.0
-            total_budget_val = m_bud["budget_amount"].sum() if not m_bud.empty else 0.0
+            actual_total_exp = m_exp["amount"].sum() if not m_exp.empty else 0.0
+            income_val = float(m_bud["income"].iloc[0]) if not m_bud.empty and "income" in m_bud.columns else 0.0
+            total_budget_val = float(m_bud["budget_amount"].sum()) if not m_bud.empty and "budget_amount" in m_bud.columns else 0.0
 
-            # 頂部關鍵指標
             col_a, col_b, col_c = st.columns(3)
             col_a.metric("本月總收入", f"NT$ {income_val:,.0f}")
             col_b.metric("本月預算", f"NT$ {total_budget_val:,.0f}")
             col_c.metric("實際總支出", f"NT$ {actual_total_exp:,.0f}", delta=f"{total_budget_val - actual_total_exp:,.0f} (剩餘預算)")
 
             st.markdown("---")
-            # 圖表分析
             col_chart1, col_chart2 = st.columns(2)
             with col_chart1:
-                fig_pie = px.pie(m_exp, values="amount", names="category", title="本月支出類別占比", hole=0.4)
-                st.plotly_chart(fig_pie, use_container_width=True)
+                if not m_exp.empty:
+                    fig_pie = px.pie(m_exp, values="amount", names="category", title="本月支出類別占比", hole=0.4)
+                    st.plotly_chart(fig_pie, use_container_width=True)
+                else:
+                    st.info("本月尚無支出")
 
             with col_chart2:
-                # 類別預算 vs 實際對比表
-                cat_summary = m_exp.groupby("category")["amount"].sum().reset_index()
-                if not m_bud.empty:
-                    merged_df = pd.merge(m_bud[["category", "budget_amount"]], cat_summary, on="category", how="left").fillna(0)
-                    merged_df.columns = ["類別", "預算金額", "實際支出"]
-                    merged_df["差額 (預算-實際)"] = merged_df["預算金額"] - merged_df["實際支出"]
-                    st.write("📋 **各類別預算執行狀況**")
-                    st.dataframe(merged_df, use_container_width=True)
-                else:
-                    st.warning("⚠️ 該月份尚未設定預算，可前往「🎯 預算規劃」進行設定！")
+                if not m_exp.empty:
+                    cat_summary = m_exp.groupby("category")["amount"].sum().reset_index()
+                    if not m_bud.empty and "category" in m_bud.columns and "budget_amount" in m_bud.columns:
+                        merged_df = pd.merge(m_bud[["category", "budget_amount"]], cat_summary, on="category", how="left").fillna(0)
+                        merged_df.columns = ["類別", "預算金額", "實際支出"]
+                        merged_df["差額 (預算-實際)"] = merged_df["預算金額"] - merged_df["實際支出"]
+                        st.write("📋 **各類別預算執行狀況**")
+                        st.dataframe(merged_df, use_container_width=True)
+                    else:
+                        st.warning("⚠️ 該月份尚未設定預算，可前往「🎯 預算規劃」進行設定！")
 
     # ----------------- Tab 4: 明細管理 -----------------
     with tab4:
@@ -198,9 +205,8 @@ else:
                 r_col1.write(f"📅 {row['date'].strftime('%Y-%m-%d')}")
                 r_col2.write(f"{row['category']}")
                 r_col3.write(f"💵 **${row['amount']:,.0f}**")
-                r_col4.write(f"💬 {row['note'] or '-'}")
+                r_col4.write(f"💬 {row.get('note', '-') or '-'}")
                 
-                # 刪除單筆紀錄
                 if r_col5.button("🗑️", key=f"del_{row['id']}"):
                     supabase.table("expenses").delete().eq("id", row["id"]).execute()
                     st.toast("已成功刪除該筆紀錄！")
